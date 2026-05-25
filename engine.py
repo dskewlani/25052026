@@ -185,9 +185,9 @@ def get_live_price(symbol):
     """
     Fetch live equity/index price.
     Priority:
-      1. Angel One SmartAPI (real exchange LTP, most accurate)
-      2. yfinance history (1m candle)
-      3. yfinance fast_info
+      1. Angel One SmartAPI (real exchange LTP — most accurate)
+      2. NSE India direct API (index quotes endpoint)
+      3. yfinance — ONLY for equity symbols not available above
     Returns float or None.
     """
     # ── 1. Angel One (real LTP from exchange) ────────────────────────────────
@@ -202,10 +202,40 @@ def get_live_price(symbol):
             lp = _angel.get_equity_ltp(symbol)
             if lp and np.isfinite(lp) and lp > 0:
                 return lp
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[engine] get_live_price Angel exception for {symbol}: {e}")
 
-    # ── 2. yfinance history ───────────────────────────────────────────────────
+    # ── 2. NSE India direct API for index prices ──────────────────────────────
+    try:
+        _NSE_INDEX_MAP = {
+            "^NSEI":    "NIFTY 50",
+            "^NSEBANK": "NIFTY BANK",
+            "^CNXIT":   "NIFTY IT",
+            "^INDIAVIX":"India VIX",
+            "^BSESN":   None,   # BSE not on NSE API
+            "NIFTY50":  "NIFTY 50",
+            "BANKNIFTY":"NIFTY BANK",
+            "NIFTY":    "NIFTY 50",
+        }
+        nse_name = _NSE_INDEX_MAP.get(symbol.upper())
+        if nse_name:
+            session = _get_nse_session()
+            url = "https://www.nseindia.com/api/allIndices"
+            resp = session.get(url, headers={
+                "Accept": "application/json",
+                "Referer": "https://www.nseindia.com/",
+            }, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                for item in data.get("data", []):
+                    if item.get("index", "").upper() == nse_name.upper():
+                        lp = float(item.get("last", 0))
+                        if lp > 0:
+                            return lp
+    except Exception as e:
+        print(f"[engine] get_live_price NSE API exception for {symbol}: {e}")
+
+    # ── 3. yfinance fallback (equity only — not used for options CMP) ─────────
     try:
         t = yf.Ticker(symbol)
         h = t.history(period="1d", interval="1m")
@@ -216,7 +246,6 @@ def get_live_price(symbol):
     except Exception:
         pass
 
-    # ── 3. yfinance fast_info ─────────────────────────────────────────────────
     try:
         lp = yf.Ticker(symbol).fast_info.last_price
         return float(lp) if lp and np.isfinite(float(lp)) and float(lp) > 0 else None
@@ -387,61 +416,108 @@ def _get_nse_chain_cached(index_name: str) -> dict:
 
 
 def get_spot_cached(index_name: str):
-    """Live NIFTY/BANKNIFTY spot with TTL cache."""
+    """
+    Live NIFTY/BANKNIFTY spot with TTL cache.
+    Uses Angel One first, then NSE API, then yfinance as last resort.
+    """
     import time as _t
-    sym   = "^NSEBANK" if "BANK" in index_name.upper() else "^NSEI"
-    now   = _t.time()
-    cached = _spot_cache.get(sym)
+    # Normalise: NIFTY50 → NIFTY for Angel index lookup
+    _idx = "BANKNIFTY" if "BANK" in index_name.upper() else "NIFTY"
+    sym_yf = "^NSEBANK" if "BANK" in index_name.upper() else "^NSEI"
+
+    now    = _t.time()
+    cached = _spot_cache.get(_idx)
     if cached and (now - cached[1]) < _SPOT_CACHE_TTL:
         return cached[0]
-    price = get_live_price(sym)
+
+    # 1. Angel One index LTP
+    try:
+        import angel_api as _angel
+        if _angel.is_configured():
+            lp = _angel.get_index_ltp(_idx)
+            if lp and lp > 0:
+                _spot_cache[_idx] = (lp, now)
+                return lp
+    except Exception:
+        pass
+
+    # 2. NSE allIndices API
+    try:
+        _NSE_NAME = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
+        nse_name = _NSE_NAME.get(_idx)
+        if nse_name:
+            session = _get_nse_session()
+            resp = session.get("https://www.nseindia.com/api/allIndices", headers={
+                "Accept": "application/json",
+                "Referer": "https://www.nseindia.com/",
+            }, timeout=8)
+            if resp.status_code == 200:
+                for item in resp.json().get("data", []):
+                    if item.get("index", "").upper() == nse_name.upper():
+                        lp = float(item.get("last", 0))
+                        if lp > 0:
+                            _spot_cache[_idx] = (lp, now)
+                            return lp
+    except Exception:
+        pass
+
+    # 3. yfinance fallback
+    price = get_live_price(sym_yf)
     if price:
-        _spot_cache[sym] = (price, now)
+        _spot_cache[_idx] = (price, now)
     return price
 
 
 def get_option_live_price(index_name: str, strike: float, opt_type: str,
                           expiry_str: str, entry_price: float):
     """
-    Returns (price, source) tuple:
-      price  — live option CMP as float (or None)
-      source — "ANGEL_LIVE" | "NSE_LIVE" | "YFINANCE" | "BS_THEORETICAL" | "STALE"
+    Returns (price, source) tuple.
+      price  — live option CMP as float
+      source — "ANGEL_LIVE" | "NSE_LIVE" | "BS_THEORETICAL" | "STALE"
 
     Priority:
       1. Angel One SmartAPI  — real exchange LTP (most accurate, free)
-      2. NSE Direct API      — real LTP from NSE website
-      3. yfinance option ticker
-      4. Black-Scholes       — theoretical only, last resort
-      5. entry_price         — stale fallback
+      2. NSE Direct API      — real LTP from NSE website option chain
+      3. Black-Scholes       — theoretical only, last resort
+      4. entry_price         — stale fallback
+
+    NOTE: yfinance removed — unreliable for Indian options, frequent data gaps.
     """
+    # Normalise index name: NIFTY50 → NIFTY, keep BANKNIFTY as-is
+    _idx_norm = "BANKNIFTY" if "BANK" in index_name.upper() else "NIFTY"
+
     # ── 1. Angel One SmartAPI (real exchange LTP) ─────────────────────────────
     try:
         import angel_api as _angel
         if _angel.is_configured():
             ltp = _angel.get_option_ltp(
-                index_name, int(strike), opt_type, expiry_str
+                _idx_norm, int(strike), opt_type, expiry_str
             )
             if ltp and float(ltp) > 0:
                 return float(ltp), "ANGEL_LIVE"
-    except Exception:
-        pass
+            else:
+                print(f"[engine] Angel LTP returned None/0 for {_idx_norm} {strike} {opt_type} {expiry_str}")
+    except Exception as e:
+        print(f"[engine] Angel get_option_ltp exception: {e}")
 
     # ── 2. NSE Live (Direct API + nsepython fallback) ─────────────────────────
     try:
         from datetime import datetime as _dt
-        chain = _get_nse_chain_cached(index_name)
+        # Use normalised index name for NSE chain fetch
+        chain = _get_nse_chain_cached(_idx_norm)
         if chain:
-            # Try multiple expiry date formats NSE might use
             try:
                 exp_dt   = _dt.strptime(expiry_str, "%Y-%m-%d")
+                # NSE uses "29-May-2025" format in option chain
                 exp_nse1 = exp_dt.strftime("%d-%b-%Y")   # 29-May-2025
-                exp_nse2 = exp_dt.strftime("%d %b %Y")   # 29 May 2025
-                exp_nse3 = exp_dt.strftime("%d-%b-%y")   # 29-May-25
+                exp_nse2 = exp_dt.strftime("%-d-%b-%Y")  # 5-Jun-2025  (no zero pad, Linux)
+                exp_nse3 = exp_dt.strftime("%d %b %Y")   # 29 May 2025
+                exp_nse4 = exp_dt.strftime("%d-%b-%y")   # 29-May-25
             except Exception:
-                exp_nse1 = exp_nse2 = exp_nse3 = expiry_str
+                exp_nse1 = exp_nse2 = exp_nse3 = exp_nse4 = expiry_str
 
             strike_int = int(strike)
-            for exp_fmt in (exp_nse1, exp_nse2, exp_nse3):
+            for exp_fmt in (exp_nse1, exp_nse2, exp_nse3, exp_nse4):
                 key = f"{strike_int}_{exp_fmt}_{opt_type}"
                 if key in chain:
                     return chain[key], "NSE_LIVE"
@@ -459,7 +535,7 @@ def get_option_live_price(index_name: str, strike: float, opt_type: str,
                         parts = c.split("_")
                         if len(parts) >= 3:
                             exp_part = "_".join(parts[1:-1])
-                            for fmt in ("%d-%b-%Y", "%d %b %Y", "%d-%b-%y"):
+                            for fmt in ("%d-%b-%Y", "%d %b %Y", "%d-%b-%y", "%-d-%b-%Y"):
                                 try:
                                     cd   = _dt.strptime(exp_part, fmt)
                                     diff = abs((cd - target_dt).days)
@@ -473,28 +549,12 @@ def get_option_live_price(index_name: str, strike: float, opt_type: str,
                         return chain[best_key], "NSE_LIVE"
                 except Exception:
                     pass
-    except Exception:
-        pass
+        else:
+            print(f"[engine] NSE option chain empty for {_idx_norm}")
+    except Exception as e:
+        print(f"[engine] NSE chain lookup exception: {e}")
 
-    # ── 2. yfinance option ticker ─────────────────────────────────────────────
-    try:
-        from datetime import datetime as _dt2
-        exp_dt2  = _dt2.strptime(expiry_str, "%Y-%m-%d")
-        exp_str2 = exp_dt2.strftime("%d%b%y").upper()     # 29MAY25
-        sym      = f"{index_name.upper()}{exp_str2}{int(strike)}{opt_type}.NS"
-        t        = yf.Ticker(sym)
-        h        = t.history(period="1d", interval="1m")
-        if h is not None and not h.empty:
-            lp = float(h["Close"].iloc[-1])
-            if np.isfinite(lp) and lp > 0:
-                return lp, "YFINANCE"
-        lp = t.fast_info.last_price
-        if lp and np.isfinite(float(lp)) and float(lp) > 0:
-            return float(lp), "YFINANCE"
-    except Exception:
-        pass
-
-    # ── 3. Black-Scholes with live spot (THEORETICAL — not market price) ──────
+    # ── 3. Black-Scholes with live spot (THEORETICAL — last resort) ───────────
     try:
         from datetime import date as _date
         spot = get_spot_cached(index_name)
@@ -506,8 +566,8 @@ def get_option_live_price(index_name: str, strike: float, opt_type: str,
             price = bs_greeks(spot, float(strike), T, r, iv, opt_type).get("price", 0)
             if price and float(price) > 0:
                 return float(price), "BS_THEORETICAL"
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[engine] BS fallback exception: {e}")
 
     # ── 4. Stale entry price ──────────────────────────────────────────────────
     return entry_price, "STALE"
